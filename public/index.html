@@ -139,6 +139,7 @@
                 <button data-action="show-modal" data-modal="createGroup" class="secondary" disabled>New Group</button>
                 <button data-action="show-modal" data-modal="joinGroup" class="secondary" disabled>Join Group</button>
                 <button data-action="show-modal" data-modal="createDm" class="secondary" disabled>New DM</button>
+                <button data-action="show-modal" data-modal="relays" class="secondary">Relays</button>
             </div>
         </div>
         <div id="channels"></div>
@@ -237,6 +238,7 @@
             this.state.channels = channels ?? {};
             this.state.profiles = profiles ?? {};
             this.state.currentChannelId = currentChannelId ?? 'public';
+            await this.loadRelays(); // This was confirmed to be added in a previous step, removing stale comment
             if (this.state.identity.pubKey && this.state.profiles[this.state.identity.pubKey]) {
                 this.state.identity.profile = this.state.profiles[this.state.identity.pubKey];
             }
@@ -246,7 +248,26 @@
             Object.values(this.state.channels).forEach(ch => ch.lastEventTimestamp ??= 0);
         }
         async saveIdentity(skHex) { await localforage.setItem('identity_v2', {privKeyHex: skHex}); }
-        async clearIdentity() { await localforage.removeItem('identity_v2'); }
+        async clearIdentity() {
+            await localforage.removeItem('identity_v2');
+            await localforage.removeItem('channels_v2');
+            await localforage.removeItem('profiles_v2');
+            await localforage.removeItem('currentChannelId_v2');
+            // Remove all message stores
+            const keys = await localforage.keys();
+            const messageKeys = keys.filter(key => key.startsWith('messages_'));
+            for (const key of messageKeys) {
+                await localforage.removeItem(key);
+            }
+            // Also clear these from the current in-memory state
+            this.state.channels = {};
+            this.state.messages = {};
+            this.state.profiles = {}; // Clear profiles
+            this.state.currentChannelId = null;
+            // Re-add public channel to in-memory state as it's not user-specific
+            this.state.channels.public = {id: 'public', name: 'Public Channel', type: 'public', unread: 0, lastEventTimestamp: 0};
+
+        }
         saveChannels() { return localforage.setItem('channels_v2', this.state.channels); }
         saveProfiles() { return localforage.setItem('profiles_v2', this.state.profiles); }
         saveCurrentChannelId() { return localforage.setItem('currentChannelId_v2', this.state.currentChannelId); }
@@ -259,6 +280,8 @@
         async deleteMessages(channelId) {
             if (channelId) return localforage.removeItem(`messages_${channelId}`);
         }
+        saveRelays() { return localforage.setItem('relays_v2', this.state.relays); }
+        async loadRelays() { this.state.relays = await localforage.getItem('relays_v2') ?? ['wss://relay.damus.io', 'wss://relay.nostr.band', 'wss://nos.lol', 'wss://relay.snort.social']; }
     }
 
     class UIManager {
@@ -400,7 +423,18 @@
                 createGroup: { title: 'Create Group', body: `<label for="group-name-input">Group Name:</label><input type="text" id="group-name-input">`, buttons: `<button data-action="close-modal" data-modal="createGroup">Cancel</button><button data-action="create-group">Create</button>` },
                 joinGroup: { title: 'Join Group', body: `<label for="join-group-id-input">Group ID:</label><input type="text" id="join-group-id-input"><label for="join-group-key-input">Secret Key (Base64):</label><input type="text" id="join-group-key-input"><label for="join-group-name-input">Group Name:</label><input type="text" id="join-group-name-input">`, buttons: `<button data-action="close-modal" data-modal="joinGroup">Cancel</button><button data-action="join-group">Join</button>` },
                 createDm: { title: 'New Direct Message', body: `<label for="dm-pubkey-input">Recipient's Public Key (npub/hex):</label><input type="text" id="dm-pubkey-input">`, buttons: `<button data-action="close-modal" data-modal="createDm">Cancel</button><button data-action="create-dm">Start</button>` },
-                groupInfo: { title: 'Group Info', body: `<p>Share these details to invite users:</p><label>Group ID:</label><input type="text" id="group-info-id" readonly><label>Secret Key (Base64):</label><input type="text" id="group-info-key" readonly>`, buttons: `<button data-action="close-modal" data-modal="groupInfo">Close</button>` }
+                groupInfo: { title: 'Group Info', body: `<p>Share these details to invite users:</p><label>Group ID:</label><input type="text" id="group-info-id" readonly><label>Secret Key (Base64):</label><input type="text" id="group-info-key" readonly>`, buttons: `<button data-action="close-modal" data-modal="groupInfo">Close</button>` },
+                relays: {
+                    title: 'Manage Relays',
+                    body: `
+                        <label for="relay-url-input">Relay URL (wss://):</label>
+                        <input type="text" id="relay-url-input" placeholder="wss://your.relay.com">
+                        <button data-action="add-relay" style="margin-top: 8px; margin-bottom: 16px;">Add Relay</button>
+                        <h4>Current Relays:</h4>
+                        <ul id="current-relays-list" style="list-style: none; padding: 0; max-height: 150px; overflow-y: auto;"></ul>
+                    `,
+                    buttons: `<button data-action="close-modal" data-modal="relays">Close</button>`
+                }
             };
             const template = document.getElementById('modal-template');
             for (const name in modalDefs) {
@@ -416,6 +450,20 @@
             }
         }
         toggleModal(name, show) { this.modals[name]?.el.classList.toggle('hidden', !show); }
+        renderRelayModal() {
+            const listEl = this.modals.relays.el.querySelector('#current-relays-list');
+            if (!listEl) return;
+            listEl.innerHTML = ''; // Clear existing list
+            this.app.state.relays.forEach(relayUrl => {
+                const item = document.createElement('li');
+                item.style = "display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px solid var(--border);";
+                item.innerHTML = `
+                    <span style="overflow: hidden; text-overflow: ellipsis; white-space: nowrap;">${Utils.escapeHtml(relayUrl)}</span>
+                    <button data-action="remove-relay" data-relay-url="${Utils.escapeHtml(relayUrl)}" class="danger" style="padding: 4px 8px; font-size: 12px;">Remove</button>
+                `;
+                listEl.appendChild(item);
+            });
+        }
     }
 
     class NostrService {
@@ -433,8 +481,19 @@
             if (!this.pool) return;
             this.subs.forEach(sub => sub.unsub());
             this.subs.clear();
-            this.pool.close(this.app.state.relays);
+            // Ensure pool.close uses current relays before they are changed or pool is nullified.
+            if (this.pool) {
+                this.pool.close(this.app.state.relays);
+            }
             this.pool = null;
+        }
+        async updateRelays(newRelaysList) {
+            this.app.state.relays = [...new Set(newRelaysList)].filter(url => url.startsWith('wss://')); // Deduplicate and validate
+            await this.app.stateManager.saveRelays();
+            this.disconnect(); // Disconnect from old relays
+            this.connect();    // Connect to new relays
+            this.app.uiManager.renderChannels(); // Update public channel meta
+            this.app.uiManager.showToast('Relay list updated. Reconnecting...', 'info');
         }
         subscribe(id, filters) {
             this.subs.get(id)?.unsub();
@@ -545,6 +604,32 @@
                 'show-group-info': () => {
                     const channel = this.state.channels[this.state.currentChannelId];
                     this.showGroupInfoModal(channel.id, channel.secretKey, channel.name);
+                },
+                'add-relay': async () => {
+                    const urlInput = this.uiManager.modals.relays.relay_url_input;
+                    const newRelayUrl = urlInput.value.trim();
+                    if (newRelayUrl.startsWith('wss://') && !this.state.relays.includes(newRelayUrl)) {
+                        const updatedRelays = [...this.state.relays, newRelayUrl];
+                        await this.nostrService.updateRelays(updatedRelays);
+                        this.uiManager.renderRelayModal();
+                        urlInput.value = ''; // Clear input
+                    } else if (!newRelayUrl.startsWith('wss://')) {
+                        this.uiManager.showToast('Invalid relay URL. Must start with wss://', 'error');
+                    } else {
+                        this.uiManager.showToast('Relay already in list.', 'info');
+                    }
+                },
+                'remove-relay': async () => {
+                    const relayUrlToRemove = target.dataset.relayUrl;
+                    if (relayUrlToRemove) {
+                        const updatedRelays = this.state.relays.filter(url => url !== relayUrlToRemove);
+                        if (updatedRelays.length === 0) {
+                             this.uiManager.showToast('Cannot remove all relays. Add another one first.', 'error');
+                             return;
+                        }
+                        await this.nostrService.updateRelays(updatedRelays);
+                        this.uiManager.renderRelayModal();
+                    }
                 }
             };
             if (actions[action]) await actions[action]();
@@ -558,14 +643,46 @@
                 if (skInput.startsWith('nsec')) skHex = nip19.decode(skInput).data;
                 else if (/^[0-9a-fA-F]{64}$/.test(skInput)) skHex = skInput;
                 else throw new Error('Invalid secret key format.');
+                // Removed duplicated skHex declaration here
+
+                // Clear previous user's in-memory state before loading new one
+                // This is a lighter version of clearIdentity, focusing on in-memory state
+                // as localforage will be overwritten or read by the new identity's load.
+                this.state.channels = { public: {id: 'public', name: 'Public Channel', type: 'public', unread: 0, lastEventTimestamp: 0} };
+                this.state.messages = {};
+                this.state.profiles = {};
+                this.state.currentChannelId = 'public'; // Default to public after identity change
+
                 this.state.identity.sk = Utils.hexToUint8Array(skHex);
                 this.state.identity.pubKey = getPublicKey(this.state.identity.sk);
-                await this.stateManager.saveIdentity(skHex);
-                this.nostrService.connect();
-                await this.nostrService.fetchProfile(this.state.identity.pubKey);
-                this.uiManager.renderIdentity();
+                await this.stateManager.saveIdentity(skHex); // Saves new identity key
+
+                // Load data for the new identity
+                // These would typically be part of stateManager.load(), replicating parts here for immediate effect
+                const [channels, profiles, currentChannelId] = await Promise.all([
+                    localforage.getItem('channels_v2'),
+                    localforage.getItem('profiles_v2'),
+                    localforage.getItem('currentChannelId_v2')
+                ]);
+                this.state.channels = {...this.state.channels, ...(channels ?? {})}; // Merge with public, ensuring it's not lost if channels_v2 is empty
+                this.state.profiles = profiles ?? {};
+                this.state.currentChannelId = currentChannelId ?? 'public';
+                if (this.state.identity.pubKey && this.state.profiles[this.state.identity.pubKey]) {
+                    this.state.identity.profile = this.state.profiles[this.state.identity.pubKey];
+                }
+                 // Ensure public channel is there if channels_v2 was empty or didn't include it
+                if (!this.state.channels.public) {
+                    this.state.channels.public = {id: 'public', name: 'Public Channel', type: 'public', unread: 0, lastEventTimestamp: 0};
+                }
+                Object.values(this.state.channels).forEach(ch => ch.lastEventTimestamp ??= 0);
+                // Messages for channels will be loaded on demand by selectChannel -> renderMessagesForCurrentChannel -> loadMessages
+
+                this.nostrService.connect(); // Reconnects with new identity, re-subscribes
+                await this.nostrService.fetchProfile(this.state.identity.pubKey); // Fetches new profile
+
+                this.uiManager.renderAll(); // Re-render everything for the new user state
                 this.uiManager.updateSidebarButtonsState();
-                this.selectChannel(this.state.currentChannelId ?? 'public');
+                this.selectChannel(this.state.currentChannelId); // Selects the (potentially new) current channel
                 this.uiManager.showToast('Identity saved!', 'success');
             } catch (e) {
                 this.uiManager.showToast(`Error: ${e.message}`, 'error');
@@ -602,6 +719,9 @@
                 profile_picture_input.value = profile?.picture ?? '';
                 profile_nip05_input.value = profile?.nip05 ?? '';
             }
+            if (modalName === 'relays') { // Ensuring this is active
+                this.uiManager.renderRelayModal();
+            }
             this.uiManager.toggleModal(modalName, true);
         }
 
@@ -637,7 +757,7 @@
                     channelId = otherUser;
                     decryptedContent = await nip04.decrypt(Utils.uint8ArrayToHex(this.state.identity.sk), otherUser, event.content);
                     if (!this.state.channels[channelId]) {
-                        this.state.channels[channelId] = {id: channelId, name: Utils.shortenPubkey(channelId), type: 'dm', pubkey: channelId, unread: 0};
+                        this.state.channels[channelId] = {id: channelId, name: Utils.shortenPubkey(channelId), type: 'dm', pubkey: channelId, unread: 0, lastEventTimestamp: Utils.now()};
                         await this.stateManager.saveChannels();
                         this.uiManager.renderChannels();
                         this.nostrService.fetchProfile(channelId);
